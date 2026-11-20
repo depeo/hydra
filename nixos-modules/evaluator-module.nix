@@ -16,7 +16,7 @@ let
 
   inherit
     (import ./web-app-env.nix {
-      inherit lib;
+      inherit lib pkgs;
       cfg = webCfg;
     })
     baseDir
@@ -25,6 +25,13 @@ let
     ;
 
   format = pkgs.formats.toml { };
+
+  # What the evaluator runs, with the Nix this machine uses.
+  hydraPrograms = pkgs.callPackage ../packaging/programs.nix {
+    nix = config.nix.package;
+    nix-eval-jobs = cfg.nixEvalJobsPackage;
+  };
+  programs = hydraPrograms.programs.hydra-evaluator;
 in
 
 {
@@ -63,17 +70,81 @@ in
 
       package = mkOption {
         type = types.package;
+        default = pkgs.hydraComponents.hydra-evaluator;
+        defaultText = literalExpression "pkgs.hydraComponents.hydra-evaluator";
         description = "The `hydra-evaluator` package.";
+      };
+
+      helpersPackage = mkOption {
+        type = types.package;
+        default = pkgs.hydraComponents.hydra-evaluator-helpers;
+        defaultText = literalExpression "pkgs.hydraComponents.hydra-evaluator-helpers";
+        description = ''
+          The package providing `hydra-fetch-input` and `hydra-prepare-declarative-jobset`,
+          which the evaluator runs.
+        '';
+      };
+
+      nixEvalJobsPackage = mkOption {
+        type = types.package;
+        default = pkgs.hydraComponents.nix-eval-jobs;
+        defaultText = literalExpression "pkgs.hydraComponents.nix-eval-jobs";
+        description = "The `nix-eval-jobs` package the evaluator runs.";
       };
 
       settings = mkOption {
         type = types.submodule {
           freeformType = format.type;
           options = {
+            allow_import_from_derivation = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Whether jobsets may import from derivations.
+                Off unless asked for, because it lets an evaluation demand builds.
+              '';
+            };
+            allow_unrestricted_eval = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Whether non-flake jobsets are evaluated without `restrict-eval`.
+                Off unless asked for, because it lets an evaluation read any path and URL.
+              '';
+            };
+            evaluator_workers = mkOption {
+              type = types.ints.positive;
+              default = 1;
+              description = "How many `nix-eval-jobs` workers to run.";
+            };
+            evaluator_max_memory_size = mkOption {
+              type = types.ints.positive;
+              default = 4096;
+              description = "The memory each worker may use, in MiB, before it is restarted.";
+            };
+            evaluator_max_jobs = mkOption {
+              type = types.ints.unsigned;
+              default = 1;
+              description = "How many builds an evaluation may run locally, e.g. for import-from-derivation. 0 forbids local builds.";
+            };
             max_concurrent_evals = mkOption {
               type = types.ints.positive;
               default = 4;
               description = "How many jobsets to evaluate at once.";
+            };
+            eval_timeout = mkOption {
+              type = types.ints.positive;
+              default = 3600;
+              description = "How many seconds an evaluation may run before the evaluator kills it and marks the jobset failed.";
+            };
+            roots_dir = mkOption {
+              type = types.path;
+              default = webCfg.gcRootsDir;
+              defaultText = literalExpression "config.services.hydra-dev.gcRootsDir";
+              description = ''
+                Where to root the evaluated derivations.
+                It must be the directory `hydra-update-gc-roots` tidies.
+              '';
             };
           };
         };
@@ -107,6 +178,9 @@ in
     environment.etc."hydra/evaluator.toml".source = format.generate "evaluator.toml" cfg.settings;
 
     systemd.services.hydra-evaluator = {
+      # Hydra names every program it runs by its own variable, never by
+      # `PATH`; see the `hydra-programs` crate.
+      enableDefaultPath = false;
       wantedBy = [ "multi-user.target" ];
       requires = [ "hydra-init.service" ];
       # Not `hydra.conf`: only the Perl the evaluator runs reads it, and
@@ -116,16 +190,20 @@ in
         "hydra-init.service"
         "network.target"
       ];
-      path = with pkgs; [
-        hostname-debian
-        # Because hydra-evaluator calls `hydra-eval-jobset`. If we
-        # move that perl script into rust, then we can get rid of
-        # this.
-        webCfg.package
-      ];
-      environment = env // {
-        HYDRA_DATABASE_URL = dbUrlWithAppName "hydra-evaluator";
-      };
+      # Not for anything Hydra runs, but for what Nix runs; see
+      # `packaging/programs.nix`.
+      path = programs.path;
+      environment =
+        env
+        // hydraPrograms.envFor {
+          # The Perl that has to stay so: input types are a plugin interface.
+          localPath = name: "${cfg.helpersPackage}/bin/${name}";
+        } programs
+        // {
+          HYDRA_DATABASE_URL = dbUrlWithAppName "hydra-evaluator";
+          # What plugins from outside Hydra run.
+          HYDRA_PLUGIN_PATH = lib.makeBinPath webCfg.pluginPath;
+        };
       serviceConfig = {
         ExecStart = escapeShellArgs [
           "@${cfg.package}/bin/hydra-evaluator"

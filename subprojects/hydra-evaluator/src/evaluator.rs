@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use color_eyre::eyre::{self, WrapErr as _};
 use futures::{FutureExt as _, StreamExt as _};
-use tokio::process::Command;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
+use tracing::Instrument as _;
 
 use crate::config::HydraConfig;
-use crate::queries::JobsetQueries as _;
+use crate::queries;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -59,22 +59,31 @@ struct State {
 
 pub(crate) struct Evaluator {
     db: db::Database,
-    max_evals: usize,
+    config: Arc<HydraConfig>,
+    available: Arc<crate::store_paths::Availability>,
+    roots_dir: Arc<std::path::Path>,
     eval_one: Option<(String, String)>,
     state: Arc<Mutex<State>>,
     notify_work: Arc<Notify>,
+    /// Bounds the follow-ups of evaluations that freed their slot to one per
+    /// slot, which is what the pool is sized for.
+    followups: Arc<Semaphore>,
 }
 
 impl Evaluator {
     pub(crate) fn new(
         db: db::Database,
-        config: &HydraConfig,
+        config: Arc<HydraConfig>,
+        available: Arc<crate::store_paths::Availability>,
+        roots_dir: Arc<std::path::Path>,
         eval_one: Option<(String, String)>,
     ) -> Self {
-        let max_evals = config.max_concurrent_evals();
         Self {
             db,
-            max_evals,
+            followups: Arc::new(Semaphore::new(config.max_concurrent_evals())),
+            config,
+            available,
+            roots_dir,
             eval_one,
             state: Arc::new(Mutex::new(State::default())),
             notify_work: Arc::new(Notify::new()),
@@ -161,11 +170,11 @@ impl Evaluator {
     }
 
     fn compute_sleep_duration(&self, state: &State) -> Duration {
-        if state.running_evals >= self.max_evals {
+        if state.running_evals >= self.config.max_concurrent_evals() {
             return Duration::MAX;
         }
 
-        let now = now_epoch();
+        let now = jiff::Timestamp::now().as_second();
         let mut sleep_secs = i64::MAX;
 
         for jobset in state.jobsets.values() {
@@ -238,7 +247,7 @@ impl Evaluator {
     }
 
     async fn read_jobsets(&self) -> eyre::Result<()> {
-        let rows = self.db.get().await?.get_schedulable_jobsets().await?;
+        let rows = queries::get_schedulable_jobsets(&mut self.db.get().await?).await?;
 
         let mut state = self.state.lock().await;
         let mut seen = HashSet::new();
@@ -316,7 +325,7 @@ impl Evaluator {
             return Ok(false);
         }
 
-        let now = now_epoch();
+        let now = jiff::Timestamp::now().as_second();
         if jobset.last_checked_time + jobset.check_interval <= now {
             if jobset.evaluation_style == Some(EvaluationStyle::OneAtATime) {
                 return self.should_evaluate_one_at_a_time(jobset).await;
@@ -337,10 +346,10 @@ impl Evaluator {
     async fn should_evaluate_one_at_a_time(&self, jobset: &Jobset) -> eyre::Result<bool> {
         let mut conn = self.db.get().await?;
 
-        let eval_id = conn
-            .get_latest_eval_id(jobset.id)
+        let eval_id = queries::get_latest_eval(&mut conn, jobset.id)
             .await
-            .wrap_err_with(|| format!("checking one-at-a-time for {}", jobset.display()))?;
+            .wrap_err_with(|| format!("checking one-at-a-time for {}", jobset.display()))?
+            .map(|e| e.id);
 
         let Some(eval_id) = eval_id else {
             tracing::debug!(
@@ -350,8 +359,7 @@ impl Evaluator {
             return Ok(true);
         };
 
-        let unfinished = conn
-            .eval_has_unfinished_builds(eval_id)
+        let unfinished = queries::eval_has_unfinished_builds(&mut conn, eval_id)
             .await
             .wrap_err_with(|| format!("checking unfinished builds for {}", jobset.display()))?;
 
@@ -398,7 +406,7 @@ impl Evaluator {
         });
 
         for (jobset_id, _, _) in candidates {
-            if state.running_evals >= self.max_evals {
+            if state.running_evals >= self.config.max_concurrent_evals() {
                 break;
             }
             // Re-borrow the jobset from state
@@ -423,7 +431,7 @@ impl Evaluator {
         project: String,
         jobset_name: String,
     ) -> eyre::Result<()> {
-        let now = now_epoch();
+        let now = jiff::Timestamp::now().as_second();
         let jobset_display = format!("{project}:{jobset_name} (jobset#{jobset_id})");
 
         let last_checked = state
@@ -437,41 +445,9 @@ impl Evaluator {
             now - last_checked,
         );
 
-        self.db
-            .get()
-            .await?
-            .set_jobset_start_time(jobset_id, now)
+        queries::set_jobset_start_time(&mut self.db.get().await?, jobset_id, now)
             .await
             .wrap_err("failed to set startTime")?;
-
-        let child = match Command::new("hydra-eval-jobset")
-            .arg(&project)
-            .arg(&jobset_name)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                tracing::error!("failed to spawn hydra-eval-jobset for {jobset_display}: {e}");
-                // Clean up as if the eval had failed — startTime was
-                // already written, and leaving it set would show the
-                // jobset as evaluating forever while it retries in a
-                // tight loop. (In the C++ version exec failure happened
-                // in the forked child, so the reaper always ran this.)
-                if let Some(jobset) = state.jobsets.get_mut(&jobset_id) {
-                    jobset.trigger_time = None;
-                    jobset.last_checked_time = now;
-                }
-                let status = format!("failed to start: {e}");
-                if let Err(e) = update_db_after_eval(&self.db, jobset_id, false, &status, now).await
-                {
-                    tracing::error!("exception setting jobset error: {e:#}");
-                }
-                if self.eval_one.is_some() {
-                    std::process::exit(1);
-                }
-                return Ok(());
-            }
-        };
 
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
         state.running_evals += 1;
@@ -482,30 +458,52 @@ impl Evaluator {
         let db = self.db.clone();
         let state_arc = Arc::clone(&self.state);
         let notify_work = Arc::clone(&self.notify_work);
+        let followups = Arc::clone(&self.followups);
 
-        tokio::spawn(async move {
-            reap_child(
-                child,
-                kill_rx,
-                jobset_id,
-                jobset_display,
-                now,
-                eval_one,
-                db,
-                state_arc,
-                notify_work,
-            )
-            .await;
-        });
+        let config = Arc::clone(&self.config);
+        let timeout = config.eval_timeout();
+        let available = Arc::clone(&self.available);
+        let roots_dir = Arc::clone(&self.roots_dir);
+        let trace = format!("{now}.{jobset_id}");
+
+        // Everything logged during the evaluation names its jobset.
+        let span =
+            tracing::info_span!("eval", project = %project, jobset = %jobset_name, id = jobset_id);
+        tokio::spawn(
+            async move {
+                let evaluation = crate::evaluate::evaluate(
+                    &db,
+                    &config,
+                    &available,
+                    &roots_dir,
+                    &project,
+                    &jobset_name,
+                    &trace,
+                );
+
+                reap_eval(
+                    evaluation,
+                    kill_rx,
+                    jobset_id,
+                    &trace,
+                    now,
+                    eval_one,
+                    &db,
+                    state_arc,
+                    notify_work,
+                    &followups,
+                    timeout,
+                )
+                .await;
+            }
+            .instrument(span),
+        );
 
         Ok(())
     }
 
     async fn unlock(&self) -> eyre::Result<()> {
-        self.db
-            .get()
-            .await?
-            .unlock_all_jobsets()
+        queries::unlock_all_jobsets(&mut self.db.get().await?)
             .await
             .wrap_err("failed to unlock jobsets")?;
         Ok(())
@@ -513,41 +511,55 @@ impl Evaluator {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn reap_child(
-    mut child: tokio::process::Child,
+async fn reap_eval(
+    evaluation: impl Future<Output = eyre::Result<crate::evaluate::Outcome>>,
     mut kill_rx: tokio::sync::oneshot::Receiver<()>,
     jobset_id: i32,
-    jobset_display: String,
+    trace: &str,
     start_time: db::Timestamp,
     eval_one: bool,
-    db: db::Database,
+    db: &db::Database,
     state: Arc<Mutex<State>>,
     notify_work: Arc<Notify>,
+    followups: &Semaphore,
+    timeout: Duration,
 ) {
-    let status = tokio::select! {
-        s = child.wait() => s,
+    // Dropping the future cancels the evaluation and kills its child
+    // processes. Anything it already committed stays committed.
+    let outcome = tokio::select! {
+        result = evaluation => Some(result),
         _ = &mut kill_rx => {
-            tracing::info!("killing evaluation of jobset '{jobset_display}'");
-            let _ = child.start_kill();
-            child.wait().await
+            tracing::info!("abandoning evaluation");
+            None
         }
+        () = tokio::time::sleep(timeout) => Some(Err(eyre::eyre!(
+            "evaluation timed out after {}s",
+            timeout.as_secs()
+        ))),
     };
 
-    let (exit_ok, status_str) = match &status {
-        Ok(s) => {
-            let code = s.code();
-            let ok = code == Some(0) || code == Some(1);
-            (ok, format!("{s}"))
-        }
-        Err(e) => (false, format!("error: {e}")),
+    let (status, mut succeeded) = match &outcome {
+        Some(Ok(outcome)) => (outcome.to_string(), outcome.succeeded()),
+        Some(Err(e)) => (format!("{e:#}"), false),
+        None => ("abandoned".to_owned(), true),
+    };
+    let failed = matches!(outcome, Some(Err(_)));
+    // A failure's full chain is saved on the jobset, so the log only notes it.
+    if failed {
+        tracing::info!("evaluation failed");
+        tracing::debug!("evaluation failed: {status}");
+    } else {
+        tracing::info!("evaluation {status}");
+    }
+    let followup = match outcome {
+        Some(Ok(crate::evaluate::Outcome::Evaluated { followup, .. })) => Some(followup),
+        _ => None,
     };
 
-    tracing::info!("evaluation of jobset '{}' {}", jobset_display, status_str);
-
-    let now = now_epoch();
+    let now = jiff::Timestamp::now().as_second();
 
     let mut st = state.lock().await;
-    let exit_ok = if let Some(jobset) = st.jobsets.get_mut(&jobset_id) {
+    let record_failure = if let Some(jobset) = st.jobsets.get_mut(&jobset_id) {
         // A trigger that arrived while the eval was running is kept in the
         // database (see update_jobset_after_eval); keep it in memory too so
         // the jobset is re-evaluated without waiting for another NOTIFY.
@@ -555,27 +567,43 @@ async fn reap_child(
             jobset.trigger_time = None;
         }
         jobset.last_checked_time = now;
-        exit_ok
+        failed
     } else {
         // The jobset was disabled or deleted mid-eval and its child
         // killed by read_jobsets; only clear startTime and do not record
         // the SIGKILL as an evaluation error.
-        true
+        false
     };
 
-    // Hold the lock across the DB cleanup and only mark the jobset
-    // not-running afterwards (as the C++ reaper did), so a new eval
-    // of the same jobset cannot start in between and have its fresh
-    // startTime clobbered by this transaction.
-    if let Err(e) = update_db_after_eval(&db, jobset_id, exit_ok, &status_str, now).await {
+    // This and a failed follow-up's error both clear startTime, so the
+    // jobset stays marked running until they are written. Otherwise a new
+    // eval of it could start in between and have its startTime clobbered.
+    if let Err(e) = update_db_after_eval(db, trace, jobset_id, record_failure, &status, now).await {
         tracing::error!("exception setting jobset error: {e:#}");
     }
 
-    if st.running_evals > 0 {
-        st.running_evals -= 1;
+    st.running_evals = st.running_evals.saturating_sub(1);
+    st.kill_evals.remove(&jobset_id);
+
+    // Free the slot for another jobset, but keep this one marked running
+    // until its builds are up to date, so that its next evaluation cannot
+    // race this one's follow-up.
+    if let Some(followup) = followup {
+        drop(st);
+        notify_work.notify_one();
+        let _permit = followups.acquire().await.ok();
+        if let Err(e) = followup.run(db).await {
+            let error = format!("{e:#}");
+            tracing::info!("updating the jobset's builds failed");
+            tracing::debug!("updating the jobset's builds failed: {error}");
+            if let Err(e) = update_db_after_eval(db, trace, jobset_id, true, &error, now).await {
+                tracing::error!("exception setting jobset error: {e:#}");
+            }
+            succeeded = false;
+        }
+        st = state.lock().await;
     }
     st.running_ids.remove(&jobset_id);
-    st.kill_evals.remove(&jobset_id);
 
     notify_work.notify_one();
 
@@ -583,31 +611,30 @@ async fn reap_child(
     // in eval-one mode, so a woken main loop could otherwise start a second
     // eval of the jobset before the process is gone.
     if eval_one {
-        std::process::exit(0);
+        // Non-zero when the evaluation failed: `hydra-evaluator p j` is how
+        // a single evaluation is asked for, and its caller wants to know.
+        std::process::exit(i32::from(!succeeded));
     }
 }
 
 async fn update_db_after_eval(
     db: &db::Database,
+    trace: &str,
     jobset_id: i32,
-    exit_ok: bool,
-    status_str: &str,
+    failed: bool,
+    status: &str,
     now: db::Timestamp,
 ) -> eyre::Result<()> {
-    let error_msg = (!exit_ok).then(|| format!("evaluation {status_str}"));
-    db.get()
-        .await?
-        .update_jobset_after_eval(jobset_id, error_msg.as_deref(), now)
-        .await?;
-    Ok(())
-}
+    let mut conn = db.get().await?;
 
-fn now_epoch() -> db::Timestamp {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
-        .unwrap_or(0)
+    // Only a failure is announced here. `evaluate` already sent the
+    // notification for every other outcome.
+    if failed {
+        queries::fail_jobset_eval(&mut conn, trace, jobset_id, status, now).await?;
+    } else {
+        queries::update_jobset_after_eval(&mut conn, jobset_id, now).await?;
+    }
+    Ok(())
 }
 
 fn is_broken_connection(e: &eyre::Report) -> bool {

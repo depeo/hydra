@@ -7,6 +7,7 @@ use base 'Hydra::Base::Controller::ListBuilds';
 use Hydra::Helper::Nix;
 use Hydra::Helper::CatalystUtils;
 use Hydra::Config;
+use Hydra::ExternalLink;
 
 
 sub projectChain :Chained('/') :PathPart('project') :CaptureArgs(1) {
@@ -150,7 +151,11 @@ sub updateProject {
     my $displayName = trim $c->stash->{params}->{displayname};
     error($c, "You must specify a display name.") if $displayName eq "";
 
-    my $enable_dynamic_run_command = defined $c->stash->{params}->{enable_dynamic_run_command} ? 1 : 0;
+    my $homepage = Hydra::ExternalLink->parse($c->stash->{params}->{homepage});
+    badRequest($c, "The homepage must be an http:// or https:// URL.")
+        if defined $homepage && !$homepage->isa('Hydra::ExternalLink::Accepted');
+
+    my $enable_dynamic_run_command = $c->stash->{params}->{enable_dynamic_run_command} ? 1 : 0;
     if ($enable_dynamic_run_command && !$c->config->{dynamicruncommand}->{enable}) {
         badRequest($c, "Dynamic RunCommand is not enabled by the server.");
     }
@@ -159,9 +164,9 @@ sub updateProject {
         { name => $projectName
         , displayname => $displayName
         , description => trim($c->stash->{params}->{description})
-        , homepage => trim($c->stash->{params}->{homepage})
-        , enabled => defined $c->stash->{params}->{enabled} ? 1 : 0
-        , hidden => defined $c->stash->{params}->{visible} ? 0 : 1
+        , homepage => $homepage
+        , enabled => $c->stash->{params}->{enabled} ? 1 : 0
+        , hidden => $c->stash->{params}->{visible} ? 0 : 1
         , owner => $owner
         , enable_dynamic_run_command => $enable_dynamic_run_command
         , declfile => trim($c->stash->{params}->{declarative}->{file})

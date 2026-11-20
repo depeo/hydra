@@ -114,6 +114,7 @@ impl db::RetryableError for StateError {
 pub use build::{Build, BuildOutput, BuildResultState, BuildTimings, Builds, RemoteBuild};
 use harmonia_store_derivation::derivation::Derivation;
 use harmonia_store_path::StorePath;
+use hydra_programs::Program as _;
 pub use jobset::{Jobset, JobsetID, Jobsets};
 pub use machine::{Machine, Message as MachineMessage, Pressure, Stats as MachineStats};
 pub use queue::{BuildQueueStats, Queues};
@@ -276,7 +277,8 @@ enum RealiseStepResult {
     None,
     /// Created a new resolved `BuildStep`
     Resolved,
-    Valid(Arc<Machine>),
+    /// The step was sent to a machine and is scheduled on it.
+    Valid,
     MaybeCancelled,
     CachedFailure,
 }
@@ -376,6 +378,9 @@ pub struct State {
     /// Cached from `nix_daemon_config.real_store_dir()`.
     /// `None` means the logical store dir is the filesystem path.
     pub real_store_dir: Option<std::path::PathBuf>,
+
+    /// `nix`, for copying outputs to the extra destinations.
+    nix: hydra_programs::NixPath,
 }
 
 impl State {
@@ -417,6 +422,7 @@ impl State {
     pub async fn new(mtls: MtlsConfig, config: App) -> Result<Arc<Self>, StateError> {
         let nix_config = daemon_client_utils::parse_nix_remote()
             .map_err(crate::config::ConfigError::ParseNixStore)?;
+        let nix = hydra_programs::NixPath::locate().map_err(crate::config::ConfigError::from)?;
         let store_dir = nix_config.store_dir.clone();
         let connector =
             daemon_client_utils::DaemonConnector::new(nix_config.socket.clone(), store_dir.clone());
@@ -496,6 +502,7 @@ impl State {
             upload_completion_rx: parking_lot::Mutex::new(Some(upload_completion_rx)),
             real_store_dir: nix_config.real_store_dir(),
             nix_daemon_config: nix_config,
+            nix,
             config,
         }))
     }
@@ -585,10 +592,7 @@ impl State {
     #[tracing::instrument(skip(self))]
     pub async fn remove_machine(&self, machine_id: uuid::Uuid) {
         if let Some(m) = self.machines.remove_machine(machine_id) {
-            let jobs = {
-                let jobs = m.jobs.read();
-                jobs.clone()
-            };
+            let jobs = m.close();
             for job in &jobs {
                 if let Err(e) = self
                     .fail_step(
@@ -817,6 +821,7 @@ impl State {
     ) -> Result<RealiseStepResult, StateError> {
         let free_fn = self.config.get_machine_free_fn();
 
+        let queue = constraint.queue.clone();
         let Some((machine, step_info)) = constraint.resolve(&self.machines, free_fn) else {
             return Ok(RealiseStepResult::None);
         };
@@ -1114,6 +1119,12 @@ impl State {
         };
         job.step_nr = step_nr;
 
+        // Schedule the step before the builder sees it, so builder reports and
+        // a concurrent remove_machine find it. Nothing can fail between here
+        // and `dispatch_result`, so only its error path has to remove the entry.
+        self.queues
+            .add_job_to_scheduled(&step_info, &queue, machine.clone())
+            .await;
         // Finalize the Busy row if dispatch fails below; otherwise it lingers
         // busy until restart while the step is re-dispatched under a new stepnr.
         let dispatch_result: Result<(), StateError> = async {
@@ -1154,12 +1165,12 @@ impl State {
                     None
                 },
                 resolved_drv,
-            )
-            .await?;
+            )?;
         Ok(())
         }
         .await;
         if let Err(e) = dispatch_result {
+            self.queues.remove_job_from_scheduled(drv).await;
             if let Err(e2) = self.abort_orphaned_build_step(build_id, step_nr).await {
                 tracing::error!(
                     "Failed to clear busy step after dispatch failure build_id={build_id} step_nr={step_nr} e={e2}"
@@ -1169,7 +1180,7 @@ impl State {
         }
         self.metrics.nr_steps_started.inc();
         self.metrics.nr_steps_building.add(1);
-        Ok(RealiseStepResult::Valid(machine))
+        Ok(RealiseStepResult::Valid)
     }
 
     #[tracing::instrument(skip(self), fields(%drv))]
@@ -1981,7 +1992,7 @@ impl State {
                     .map(|p| self.connector.store_dir().display(p).to_string())
                     .collect();
                 for dest_uri in &nix_copy_uris {
-                    let output = tokio::process::Command::new("nix")
+                    let output = tokio::process::Command::new(&self.nix)
                         .arg("--extra-experimental-features")
                         .arg("nix-command")
                         .arg("copy")

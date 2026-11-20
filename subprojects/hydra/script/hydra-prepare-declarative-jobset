@@ -1,7 +1,7 @@
 #! /usr/bin/env perl
 
 # Apply a declarative project's specification, on behalf of
-# `hydra-eval-jobset`, which has fetched the input containing it.
+# `hydra-evaluator`, which has fetched the input containing it.
 #
 #     hydra-prepare-declarative-jobset <project> <specification file>
 #
@@ -43,7 +43,7 @@ my $project = $db->resultset('Projects')->find({ name => $projectName })
 
 # `nix store cat`, so the store resolves the physical location itself.
 my ($res, $declText, $catErr) = captureStdoutStderr(60,
-    "nix", "--extra-experimental-features", "nix-command", "store", "cat", $declFile);
+    program("nix"), "--extra-experimental-features", "nix-command", "store", "cat", $declFile);
 die "Couldn't read declarative specification file $declFile: $catErr\n" if $res != 0;
 
 my $declSpec = eval { decode_json($declText) };

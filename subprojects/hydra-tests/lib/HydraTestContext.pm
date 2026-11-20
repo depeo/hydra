@@ -9,6 +9,7 @@ use File::Which qw(which);
 use Cwd qw(abs_path getcwd);
 use CliRunners;
 use Hydra::Helper::Exec;
+use HydraTestPrograms;
 use ShortSocketDir qw(short_socket_dir);
 
 # Set up the environment for running tests.
@@ -98,6 +99,13 @@ sub new {
         }
 
         write_file($central->{hydra_config_file}, $hydra_config);
+
+        # Built outputs go to the destination store, not the central one, so
+        # a `build` input naming one has to fetch it from there: that is what
+        # `eval_substituter` is for.
+        $central->{evaluator_config_file} = "$dir/evaluator.toml";
+        write_file($central->{evaluator_config_file},
+            defined $deststoredir ? "eval_substituter = \"file://$deststoredir\"\n" : "");
     }
 
     my $pgsql = Test::PostgreSQL->new(
@@ -136,13 +144,14 @@ sub new {
         # Env vars for central services (evaluator, hydra-init, hydra-notify, etc.).
         # Applied via local %ENV right before each process spawn.
         central_env => {
-            'HYDRA_DATA'         => $central->{hydra_data},
-            'HYDRA_CONFIG'       => $central->{hydra_config_file},
-            'HYDRA_DATABASE_URL' => $central->{hydra_database_url},
-            'NIX_CONF_DIR'       => $central->{nix_conf_dir},
-            'NIX_REMOTE'         => $central->{nix_store_uri},
-            'NIX_STATE_DIR'      => $central->{nix_state_dir}, # FIXME: remove
-            'NIX_STORE_DIR'      => $central->{nix_store_dir}, # FIXME: remove
+            'HYDRA_DATA'             => $central->{hydra_data},
+            'HYDRA_CONFIG'           => $central->{hydra_config_file},
+            'HYDRA_EVALUATOR_CONFIG' => $central->{evaluator_config_file},
+            'HYDRA_DATABASE_URL'     => $central->{hydra_database_url},
+            'NIX_CONF_DIR'           => $central->{nix_conf_dir},
+            'NIX_REMOTE'             => $central->{nix_store_uri},
+            'NIX_STATE_DIR'          => $central->{nix_state_dir}, # FIXME: remove
+            'NIX_STORE_DIR'          => $central->{nix_store_dir}, # FIXME: remove
         },
     }, $class;
 
@@ -160,14 +169,14 @@ sub new {
 sub run_cmd {
     my ($self, $timeout, @cmd) = @_;
     local @ENV{keys %{$self->{central_env}}} = values %{$self->{central_env}};
-    expectOkay($timeout, @cmd);
+    withProgramEnv(\@cmd, sub { expectOkay($timeout, @cmd) });
 }
 
 # Like run_cmd but returns ($exit, $stdout, $stderr) instead of dying.
 sub capture_cmd {
     my ($self, $timeout, @cmd) = @_;
     local @ENV{keys %{$self->{central_env}}} = values %{$self->{central_env}};
-    return captureStdoutStderr($timeout, @cmd);
+    return withProgramEnv(\@cmd, sub { captureStdoutStderr($timeout, @cmd) });
 }
 
 sub db {

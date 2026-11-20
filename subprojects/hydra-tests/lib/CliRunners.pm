@@ -4,6 +4,7 @@ use strict;
 package CliRunners;
 use Hydra::Helper::Exec;
 use QueueRunnerBuildOne;
+use HydraTestPrograms;
 our @ISA = qw(Exporter);
 our @EXPORT = qw(
     captureEvaluation
@@ -19,8 +20,10 @@ our @EXPORT = qw(
 sub captureEvaluation {
     my ($ctx, $jobset) = @_;
     $jobset = $jobset->{"jobset"} if ref $jobset eq "HASH";
+    # nix-eval-jobs' stderr is only logged at debug; tests check it.
+    local $ENV{RUST_LOG} = "hydra_evaluator=debug,info";
     return $ctx->capture_cmd(60,
-        "hydra-eval-jobset", $jobset->project->name, $jobset->name);
+        "hydra-evaluator", $jobset->project->name, $jobset->name);
 }
 
 sub evalSucceeds {
@@ -56,7 +59,8 @@ sub evalFails {
 sub sendNotifications {
     my ($ctx) = @_;
     local @ENV{keys %{$ctx->{central_env}}} = values %{$ctx->{central_env}};
-    my ($res, $stdout, $stderr) = captureStdoutStderr(60, ("hydra-notify", "--queued-only"));
+    my @cmd = ("hydra-notify", "--queued-only");
+    my ($res, $stdout, $stderr) = withProgramEnv(\@cmd, sub { captureStdoutStderr(60, @cmd) });
     if ($res) {
         utf8::decode($stdout) or die "Invalid unicode in stdout.";
         utf8::decode($stderr) or die "Invalid unicode in stderr.";
